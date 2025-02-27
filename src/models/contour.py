@@ -13,7 +13,7 @@ from jax._src.api import block_until_ready
 from functools import partial
 jax.config.update("jax_enable_x64", True)
 
-def gen_contour(Em, EM, beta, N, mu=0, fermi_dirac=False):
+def gen_contour(Em, EM, beta, N, mu=0, function=None):
     """
     Generate a contour for a matrix M based on its minimal and maximal eigenvalues.
     This contour is used to perform matrix-vector (matvec) operations.
@@ -76,10 +76,13 @@ def gen_contour(Em, EM, beta, N, mu=0, fermi_dirac=False):
     w = np.hstack([w_xi, w_neg_xi])
     xi = np.hstack([xi, -xi])
 
-    # If Fermi-Dirac weighting is requested, modify the weights accordingly.
-    if fermi_dirac:
-        w = w * complex_square_root_fermidirac(xi)
-
+    # If merging values and weights is requested, modify the weights accordingly.
+    if function == "fermi_dirac":
+        w = w * complex_square_root_fermi_dirac(xi)
+    
+    elif function == "binary_entropy":
+        w = w * complex_bin_entropy_fermi_dirac(xi)
+        
     # Scale the poles and weights by beta and return.
     return xi / beta, w / beta
 
@@ -90,7 +93,7 @@ def contour_f(x,xi,w):
     value = sum(w/(xi-x))
     return np.imag(value)
 
-def complex_square_root_fermidirac(Z):
+def complex_square_root_fermi_dirac(Z):
     """
     A holomorphic extension of the square-root Fermi-Dirac function. 
     This function is holomorphic in the regions {Re(z) < 0} and {Re(z) > 0} 
@@ -135,6 +138,101 @@ def complex_square_root_fermidirac(Z):
     # Return the holomorphic extension of the square-root Fermi-Dirac function.
     return S
 
+def complex_log_one_plus_exp(z):
+    """
+    Compute the complex logarithm of (1 + exp(z)) with branch cut adjustments
+    to maintain continuity across the complex plane.
+    
+    This function computes two versions of the logarithm:
+      - The standard logarithm log(1 + exp(z)) when the real part of z is non-positive.
+      - An adjusted logarithm that corrects the phase when the real part of z is positive.
+    
+    Args:
+        z : complex or numpy array of complex
+            Input complex number(s).
+    
+    Returns:
+        complex or numpy array of complex
+            The computed complex logarithm of (1 + exp(z)) with appropriate branch adjustments.
+    """
+    # Extract the real and imaginary parts of z
+    real_part = np.real(z)
+    imag_part = np.imag(z)
+    real_part = np.clip(real_part, -200, 200)
+    z = real_part + 1j * imag_part
+    
+    # Compute the magnitude of (1 + exp(z))
+    magnitude = np.abs(1 + np.exp(z))
+    
+    # Compute the standard logarithm of (1 + exp(z))
+    standard_log = np.log(1 + np.exp(z))
+    
+    # Compute the phase (argument) of (1 + exp(z))
+    phase_angle = np.angle(1 + np.exp(z))
+    
+    # Adjust the phase angle to ensure continuity (adjust branch cut)
+    phase_angle += 2 * np.pi * np.ceil((imag_part - np.pi) / (2 * np.pi))
+    
+    # Compute the adjusted logarithm using the magnitude and modified phase angle
+    adjusted_log = np.log(magnitude) + 1j * phase_angle
+    
+    # Select the appropriate logarithm based on the real part of z:
+    # If real_part <= 0, use standard_log; otherwise, use adjusted_log.
+    complex_log = standard_log * (real_part <= 0) + adjusted_log * (real_part > 0)
+    
+    return complex_log
+
+def complex_entropy_fermi_dirac(z):
+    """
+    Compute the log(1 + exp(z))/(1+exp(z)) with branch cut adjustments
+    to maintain continuity across the complex plane.
+    
+    This function computes two versions of the logarithm:
+      - The standard logarithm log(1 + exp(z)) when the real part of z is non-positive.
+      - An adjusted logarithm that corrects the phase when the real part of z is positive.
+    
+    Args:
+        z : complex or numpy array of complex
+            Input complex number(s).
+    
+    Returns:
+        complex or numpy array of complex
+            The computed complex logarithm of (1 + exp(z)) with appropriate branch adjustments.
+    """
+    # Extract the real and imaginary parts of z
+    real_part = np.real(z)
+    imag_part = np.imag(z)
+    # fz = 1 + np.exp(z)
+    real_part = np.clip(real_part, -200, 200)
+    z = real_part + 1j * imag_part
+    fz = 1 + np.exp(z)
+    
+    # Compute the magnitude of (1 + exp(z))
+    magnitude = np.abs(fz)
+    
+    # Compute the standard logarithm of (1 + exp(z))
+    standard_log = np.log(fz)
+    
+    # Compute the phase (argument) of (1 + exp(z))
+    phase_angle = np.angle(fz)
+    
+    # Adjust the phase angle to ensure continuity (adjust branch cut)
+    phase_angle += 2 * np.pi * np.ceil((imag_part - np.pi) / (2 * np.pi))
+    
+    # Compute the adjusted logarithm using the magnitude and modified phase angle
+    adjusted_log = np.log(magnitude) + 1j * phase_angle
+    
+    # Select the appropriate logarithm based on the real part of z:
+    # If real_part <= 0, use standard_log; otherwise, use adjusted_log.
+    complex_log = standard_log * (real_part <= 0) + adjusted_log * (real_part > 0)
+
+    return -complex_log / fz
+
+def complex_bin_entropy_fermi_dirac(z):
+    """
+    Compute the binary entropy for the Fermi-Dirac distribution.
+    """
+    return complex_entropy_fermi_dirac(z) + complex_entropy_fermi_dirac(-z)
 
 # The function is jitted with JAX for efficiency, treating the first and third arguments as static.
 @partial(jax.jit, static_argnums=(0, 2))
@@ -211,7 +309,6 @@ def shift_inv_system(c_H, v_H, Ns, D, v, shift, tol):
     return jax.scipy.sparse.linalg.bicgstab(linearmap, v, tol=tol, M=precondition_linearmap, maxiter=100)[0]
 
 # The function is jitted with JAX for efficiency, treating the first and third arguments as static.
-
 @partial(jax.jit, static_argnums=(0,2))
 def contour_matvec(c_H, v_H, Ns, D, v, tol, shifts, weights):
     """
