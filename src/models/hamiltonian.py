@@ -275,7 +275,11 @@ class deterministicHamiltonian(Hamiltonian):
     def __init__(self, Ns, Ls, beta=1,mu=0, alpha=0, fourier=True, dense=True):
         super().__init__(Ns, Ls, beta, mu, alpha, fourier, dense)
         assert dense, "Only dense Hamiltonian is supported for deterministic Hamiltonian"
-        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external)
+        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external.flatten())
+
+    def update_external(self, potential_external):
+        self.potential_external = potential_external
+        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external.flatten())
 
     # @partial(jit, static_argnums=(0,))
     def energy_kinetic(self, P):
@@ -293,7 +297,7 @@ class deterministicHamiltonian(Hamiltonian):
         energy_free = energy_kinetic + energy_external + energy_yukawa + entropy
         objective = energy_free - self.mu * jnp.sum(rho)
         # return objective, energy_free
-        return objective, energy_free, energy_kinetic, energy_external, energy_yukawa, entropy
+        return objective, energy_free, energy_kinetic, energy_external, energy_yukawa, entropy, sum(rho)
     
     # @partial(jit, static_argnums=(0,))
     def density_matrix(self, H):
