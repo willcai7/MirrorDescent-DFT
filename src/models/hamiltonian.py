@@ -17,12 +17,12 @@ def genDiscretizedLaplacianEigenvalues(Ns, Ls):
     """
     Ls = np.array(Ls)
     Ns = np.array(Ns)
-
+    dim = len(Ns)
     dxs = Ls/Ns
     
-    ks = [np.fft.fftfreq(Ns[i], d=dxs[i]) for i in range(3)]
+    ks = [np.fft.fftfreq(Ns[i], d=dxs[i]) for i in range(dim)]
     Ks = np.meshgrid(*ks, indexing='ij')
-    D = jnp.array(sum([-(2*np.pi*Ks[i])**2 for i in range(3)]))
+    D = jnp.array(sum([-(2*np.pi*Ks[i])**2 for i in range(dim)]))
     return D
 
 def genDiscretizedCosineExternalPotential(Ns, Ls):
@@ -37,11 +37,11 @@ def genDiscretizedCosineExternalPotential(Ns, Ls):
     """
     Ls = np.array(Ls)
     Ns = np.array(Ns)
-
-    ks = [np.linspace(0, Ns[i]-1, Ns[i])*Ls[i]/Ns[i] for i in range(3)]
+    dim = len(Ns)
+    ks = [np.linspace(0, Ns[i]-1, Ns[i])*Ls[i]/Ns[i] for i in range(dim)]
     Ks = np.meshgrid(*ks, indexing='ij')
-    D = jnp.array(sum([jnp.cos(Ks[i]*2*np.pi/Ls[i]) for i in range(3)]))
-    D = D.reshape([Ns[0]*Ns[1]*Ns[2], 1])
+    D = jnp.array(sum([jnp.cos(Ks[i]*2*np.pi/Ls[i]) for i in range(dim)]))
+    D = D.flatten()
     return D
 
 def dense_logm(P):
@@ -54,38 +54,54 @@ def dense_tr_xlogx_m(P):
     return jnp.sum(w * jnp.log(w))
 
 def BinEntropy(P):
-    return dense_tr_xlogx_m(P) + dense_tr_xlogx_m(jnp.eye(P.shape[0])-P)
+    return jnp.real(dense_tr_xlogx_m(P) + dense_tr_xlogx_m(jnp.eye(P.shape[0])-P))
 
 def fftnProduct(D, v):
     """
-    Multiply a vector 'v' by a diagonal matrix 'D' in 3D Fourier space.
+    Multiply a vector by a diagonal matrix in Fourier space.
+    
+    This function performs the following steps:
+    1. Reshapes the input vector into a multi-dimensional array
+    2. Applies FFT to transform to Fourier space 
+    3. Multiplies by the diagonal matrix
+    4. Applies inverse FFT to transform back to real space
+    5. Reshapes the result back to a vector
 
     Args:
-        D: (jnp.array [Ns]) Diagonal matrix in 3D Fourier space.
-        v: (jnp.array [Ns[0]*Ns[1]*Ns[1], n]) Vector to be multiplied.
-    
-    Returns:
-        v: (jnp.array [Ns[0]*Ns[1]*Ns[1], n]) Transformed vector.
+        D: (jnp.array [Ns]) Diagonal matrix in Fourier space, where Ns is a tuple of 
+           dimensions (e.g., (N1, N2, N3) for 3D)
+        v: (jnp.array [N, n]) Input vector, where N = prod(Ns) and n is the number
+           of columns (optional)
 
+    Returns:
+        (jnp.array [N, n]) or (jnp.array [N]) The transformed vector, flattened if n=1
     """
-    # Reshape the input vector 'v' into a multi-dimensional array with spatial dimensions Ns[0], Ns[1], Ns[2]
-    # The '-1' infers the size of any additional dimensions (e.g., multiple channels).
-    Ns = D.shape
-    v = jnp.fft.fftn(v.reshape([Ns[0], Ns[1], Ns[2], -1]), axes=[0, 1, 2])
+    # Get dimensions from the diagonal operator D
+    Ns = D.shape  # Shape of spatial dimensions (e.g. N1,N2,N3 for 3D)
+    dim = len(Ns) # Number of spatial dimensions
     
-    # Multiply the Fourier-transformed 'v' element-wise by the diagonal multiplier 'D'.
-    # 'D' is broadcasted along an additional axis (None adds a new axis) to match the shape of 'v'.
-    v = D[:, :, :, None] * v
+    # Reshape input vector v from [N,n] to [N1,N2,N3,n] for FFT
+    # N = prod(Ns) is total spatial points, n is number of channels
+    v = v.reshape(Ns + (-1,))  # Changed from list to tuple
     
-    # Compute the inverse FFT along the same spatial axes to transform the product back to real space.
-    # The result is then reshaped to a 2D array with shape [Ns[0]*Ns[1]*Ns[2], -1],
-    # where the spatial dimensions are flattened.
-    v = jnp.fft.ifftn(v, axes=[0, 1, 2]).reshape([Ns[0]*Ns[1]*Ns[2], -1])
+    # Transform to Fourier space along spatial dimensions
+    # Result has shape [N1,N2,N3,n] with complex values
+    v = jnp.fft.fftn(v, axes=list(range(dim)))
     
-    # Return the final transformed vector.
+    # Multiply by diagonal operator D in Fourier space
+    # D[...,None] broadcasts D to match v's shape [N1,N2,N3,n]
+    v = D[(...,) + (None,)] * v
+    
+    # Transform back to real space and reshape to original dimensions
+    # First IFFT gives [N1,N2,N3,n], then reshape to [N,n]
+    v = jnp.fft.ifftn(v, axes=list(range(dim))).reshape([-1, v.shape[-1]])
+    
+    # For single-channel case (n=1), return flattened 1D array
+    if v.shape[-1] == 1:
+        return v.flatten()
+    
     return v
 
-def fourier_matrix_1d(N):
     """
     Constructs a unitary Fourier transform matrix of size N x N.
     The (j,k) entry is (1/sqrt(N))*exp(-2*pi*i*j*k/N).
@@ -97,60 +113,35 @@ def fourier_matrix_1d(N):
 
 def genDiscretizedLaplacian(Ns, Ls):
     """
-    Constructs the discretized Laplacian operator in real space by transforming
-    the diagonal operator in the planewave (Fourier) basis.
+    Constructs the discretized Laplacian operator in real space using FFT.
+    This is a highly efficient implementation that uses JAX's vmap for vectorization
+    and avoids constructing the full Fourier matrix.
     
-    The total number of grid points is N = N1 * N2 * N3.
-    The Fourier transform matrix for the 3D grid is given by:
-       F = F1 ⊗ F2 ⊗ F3
-    where F1, F2, and F3 are the 1D Fourier matrices for each dimension.
+    Instead of explicitly constructing F and F*, we use FFT operations which are O(N log N)
+    rather than the O(N²) complexity of the dense matrix approach.
     
-    The diagonal eigenvalue for a mode (k1, k2, k3) is:
-       lambda = - [ (2*pi*k1/L1)^2 + (2*pi*k2/L2)^2 + (2*pi*k3/L3)^2 ].
-    
-    The real-space Laplacian matrix is then:
-       L = F^* D F.
+    The operator in Fourier space is diagonal with eigenvalues:
+       lambda(k1,k2,k3) = -[(2π*k1/L1)² + (2π*k2/L2)² + (2π*k3/L3)²]
     
     Args:
         Ns: (np.array [3]) Number of grid points in each dimension.
         Ls: (np.array [3]) Lengths of the domain in each dimension.
     
     Returns:
-        K: (jnp.array [N, N]) Discretized Laplacian.
+        K: (jnp.array [N, N]) Discretized Laplacian in real space.
     """
-    # Construct 1D Fourier matrices
-    F1 = fourier_matrix_1d(Ns[0])
-    F2 = fourier_matrix_1d(Ns[1])
-    F3 = fourier_matrix_1d(Ns[2])
+    N = np.prod(Ns)  # Total number of grid points
     
-    # Construct the 3D Fourier matrix as a Kronecker product
-    F = jnp.kron(jnp.kron(F1, F2), F3)  # Shape: (N1*N2*N3, N1*N2*N3)
+    # Get the eigenvalues in Fourier space
+    eigenvalues = genDiscretizedLaplacianEigenvalues(Ns, Ls)
     
-
-    # For a grid on [0, L_i] discretized with N_i points, one common way to get the 
-    # integer wave numbers is to use fftfreq and multiply by L_i.
-    k1 = jnp.fft.fftfreq(Ns[0], d=Ls[0]/Ns[0]) * Ls[0]
-    k2 = jnp.fft.fftfreq(Ns[1], d=Ls[1]/Ns[1]) * Ls[1]
-    k3 = jnp.fft.fftfreq(Ns[2], d=Ls[2]/Ns[2]) * Ls[2]
-
-    # Create a 3D grid of wave numbers.
-    K1, K2, K3 = jnp.meshgrid(k1, k2, k3, indexing='ij')
-    # Flatten them so that each mode corresponds to an entry
-    K1 = K1.flatten()
-    K2 = K2.flatten()
-    K3 = K3.flatten()
+    # Create identity matrix
+    I = jnp.eye(N)
     
-    # Compute the eigenvalues for each mode:
-    eigenvalues = -(((2 * jnp.pi * K1 / Ls[0])**2) +
-                    ((2 * jnp.pi * K2 / Ls[1])**2) +
-                    ((2 * jnp.pi * K3 / Ls[2])**2))
+    # Vectorize the FFT operation over columns of the identity matrix
+    K = jax.vmap(lambda x: fftnProduct(eigenvalues, x.reshape(-1, 1)))(I.T)
     
-    # Form the diagonal matrix D
-    D = jnp.diag(eigenvalues)
-    
-    # Since F is unitary (F^{-1} = F^*), the Laplacian in real space is:
-    K = jnp.conjugate(F.T) @ D @ F
-    return jnp.real(K)
+    return K.T
 
 def genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha):
     """
@@ -163,22 +154,31 @@ def genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha):
     Returns:
         D: (jnp.array [Ns]) Discretized Laplacian.
     """
-    Ls = np.array(Ls)
+    Ls = np.array(Ls)   
     Ns = np.array(Ns)
-
+    dim = len(Ns)
     dxs = Ls/Ns
     
-    ks = [np.fft.fftfreq(Ns[i], d=dxs[i]) for i in range(3)]
+    ks = [np.fft.fftfreq(Ns[i], d=dxs[i]) for i in range(dim)]
     Ks = np.meshgrid(*ks, indexing='ij')
-    D = jnp.array(sum([(2*np.pi*Ks[i])**2 for i in range(3)])) + alpha**2
-    D = 1/D / (Ls[0]*Ls[1]*Ls[2])*Ns[0]*Ns[1]*Ns[2]
-    D = D.at[0,0,0].set(0)
+    D = jnp.array(sum([(2*np.pi*Ks[i])**2 for i in range(dim)])) + alpha**2
+    delta_V = np.prod(Ls)/np.prod(Ns)
+    
+    # Note that we divide by delta_V^2 because we are using the Fourier 
+    # transform and the discretization of the volume together. Hence, one comes 
+    # from the discretization of the volume and the other comes from the waveplane-type basis.
+    D = 1/D /delta_V *(alpha**2)
+
     return D
 
 def genDiscretizedYukawaInteraction(Ns, Ls, alpha):
     """
-    Constructs the discretized Yukawa Interaction operator in real space by transforming
-    the diagonal operator in the planewave (Fourier) basis.
+    Constructs the discretized Yukawa Interaction operator in real space using FFT.
+    This is a highly efficient implementation that uses JAX's vmap for vectorization
+    and avoids constructing the full Fourier matrix.
+    
+    Instead of explicitly constructing F and F*, we use FFT operations which are O(N log N)
+    rather than the O(N²) complexity of the dense matrix approach.
     
     Args:
         Ns: (np.array [3]) Number of grid points in each dimension.
@@ -186,44 +186,38 @@ def genDiscretizedYukawaInteraction(Ns, Ls, alpha):
         alpha: (float) Screening length.
     
     Returns:
-        K: (jnp.array [N, N]) Discretized Laplacian.
+        K: (jnp.array [N, N]) Discretized Yukawa interaction operator.
     """
-    # Construct 1D Fourier matrices
-    F1 = fourier_matrix_1d(Ns[0])
-    F2 = fourier_matrix_1d(Ns[1])
-    F3 = fourier_matrix_1d(Ns[2])
+    N = np.prod(Ns)  # Total number of grid points
     
-    # Construct the 3D Fourier matrix as a Kronecker product
-    F = jnp.kron(jnp.kron(F1, F2), F3)  # Shape: (N1*N2*N3, N1*N2*N3)
+    # Get the eigenvalues in Fourier space
+    eigenvalues = genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha)
     
+    # Create identity matrix
+    I = jnp.eye(N)
+    
+    # Vectorize the FFT operation over columns of the identity matrix
+    K = jax.vmap(lambda x: fftnProduct(eigenvalues, x.reshape(-1, 1)))(I.T)
+    
+    return K.T
 
-    # For a grid on [0, L_i] discretized with N_i points, one common way to get the 
-    # integer wave numbers is to use fftfreq and multiply by L_i.
-    k1 = jnp.fft.fftfreq(Ns[0], d=Ls[0]/Ns[0]) * Ls[0]
-    k2 = jnp.fft.fftfreq(Ns[1], d=Ls[1]/Ns[1]) * Ls[1]
-    k3 = jnp.fft.fftfreq(Ns[2], d=Ls[2]/Ns[2]) * Ls[2]
+def gen_centers(num_particles, Ns):
+    if len(Ns) == 1:
+        return np.random.uniform(0, Ns[0], num_particles)
+    else:
+        return np.random.uniform(0, np.array(Ns), (num_particles, len(Ns)))
 
-    # Create a 3D grid of wave numbers.
-    K1, K2, K3 = jnp.meshgrid(k1, k2, k3, indexing='ij')
-    # Flatten them so that each mode corresponds to an entry
-    K1 = K1.flatten()
-    K2 = K2.flatten()
-    K3 = K3.flatten()
-    
-    # Compute the eigenvalues for each mode:
-    eigenvalues = (((2 * jnp.pi * K1 / Ls[0])**2) +
-                ((2 * jnp.pi * K2 / Ls[1])**2) +
-                ((2 * jnp.pi * K3 / Ls[2])**2)) + alpha**2
-
-    eigenvalues = 1/eigenvalues / (Ls[0]*Ls[1]*Ls[2])*Ns[0]*Ns[1]*Ns[2]
-    eigenvalues = jnp.where((K1 == 0) & (K2 == 0) & (K3 == 0), 0, eigenvalues)
-    
-    # Form the diagonal matrix D
-    D = jnp.diag(eigenvalues)
-    
-    # Since F is unitary (F^{-1} = F^*), the Laplacian in real space is:
-    K = jnp.conjugate(F.T) @ D @ F
-    return jnp.real(K)    
+def gen_rho_ext(num_particles, Ns):
+    centers = gen_centers(num_particles, Ns)
+    rho_ext = np.zeros(Ns)
+    if len(Ns) == 1:
+        for i in range(num_particles):
+            rho_ext[int(centers[i])] += 1
+    else:
+        for i in range(num_particles):
+            indices = tuple(int(coord) for coord in centers[i])  # Convert coordinates to integer indices
+            rho_ext[indices] += 1
+    return rho_ext.flatten()
 
 class Hamiltonian:
     def __init__(self, Ns, Ls, beta=1,mu=0, alpha=0, fourier=True, dense=False):
@@ -237,8 +231,8 @@ class Hamiltonian:
             alpha: (float) Screening length.
         """
 
-        self.Ns = Ns
-        self.Ls = Ls 
+        self.Ns = np.array(Ns)
+        self.Ls = np.array(Ls)
         self.mu = mu
         self.beta = beta
         self.alpha = alpha
@@ -247,75 +241,106 @@ class Hamiltonian:
         self.dense = dense
         
         # Generate the discretized Laplacian and Yukawa interaction
-        self.fourier_laplacian = genDiscretizedLaplacianEigenvalues(Ns, Ls) if fourier else None
-        self.fourier_yukawa = genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha) if fourier else None
-        self.dense_laplacian = genDiscretizedLaplacian(Ns, Ls) if dense else None
-        self.dense_yukawa = genDiscretizedYukawaInteraction(Ns, Ls, alpha) if dense else None
+        self.fourier_laplacian = genDiscretizedLaplacianEigenvalues(Ns, Ls) if fourier else None # [Ns]
+        self.fourier_yukawa = genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha) if fourier else None # [Ns]
+        self.dense_laplacian = genDiscretizedLaplacian(Ns, Ls) if dense else None # [N_vec, N_vec]
+        self.dense_yukawa = genDiscretizedYukawaInteraction(Ns, Ls, alpha) if dense else None # [N_vec, N_vec]
         
         # Generate the discretized cosine external potential
-        self.potential_external = genDiscretizedCosineExternalPotential(Ns, Ls)
+        self.potential_external = genDiscretizedCosineExternalPotential(Ns, Ls) # [N_vec]
 
+    def update_single_electron_effective_potential(self):
+        pass 
 
     def update_external(self, potential_external):
-        self.potential_external = potential_external
+        self.potential_external = potential_external # [N_vec]
+        self.update_single_electron_effective_potential()
 
-    @partial(jit, static_argnums=(0))
+    # We require rho to be a 1D array for the following 3 functions!! 
     def potential_yukawa(self, rho):
-        return fftnProduct(self.fourier_yukawa, rho)
+        return jnp.real(fftnProduct(self.fourier_yukawa, rho)) # [N_vec]
 
-    @partial(jit, static_argnums=(0))
     def energy_yukawa(self, rho):
-        return jnp.sum(rho.flatten() * self.potential_yukawa(rho).flatten())/2
+        return jnp.real(jnp.sum(rho * self.potential_yukawa(rho))/2)
 
-    @partial(jit, static_argnums=(0))
     def energy_external(self, rho):
-        return jnp.sum(rho.flatten() * self.potential_external.flatten())
+        return jnp.real(jnp.sum(rho * self.potential_external))
+
+    def update_external_yukawa(self, ratio):
+        self.ratio = ratio
+        n_particles = np.ceil(np.prod(self.Ls) * ratio).astype(int)
+        self.density_external = gen_rho_ext(n_particles, self.Ns)
+        self.potential_external = -self.potential_yukawa(self.density_external)
+        self.update_single_electron_effective_potential()
 
 class deterministicHamiltonian(Hamiltonian):
     def __init__(self, Ns, Ls, beta=1,mu=0, alpha=0, fourier=True, dense=True):
         super().__init__(Ns, Ls, beta, mu, alpha, fourier, dense)
         assert dense, "Only dense Hamiltonian is supported for deterministic Hamiltonian"
-        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external.flatten())
+        self.key = 0
+        self.N_vec = np.prod(Ns)
 
-    def update_external(self, potential_external):
-        self.potential_external = potential_external
-        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external.flatten())
+    def update_single_electron_effective_potential(self):
+        self.C = - self.dense_laplacian/2 + jnp.diag(self.potential_external)
+
 
     # @partial(jit, static_argnums=(0,))
     def energy_kinetic(self, P):
-        return jnp.trace( - P @ self.dense_laplacian) /2 
+        return jnp.real(jnp.trace( - P @ self.dense_laplacian) /2)
     
     # @partial(jit, static_argnums=(0,))
-    def objective(self, H):
-        P = self.density_matrix(H)
-        rho = jnp.diag(P)
+    def objective(self, H=None, mu=1, P=None):
+        if H is not None:
+            P = self.density_matrix(H)
+        rho = jnp.real(jnp.diag(P))
         energy_external = self.energy_external(rho)
         energy_kinetic = self.energy_kinetic(P)
         energy_yukawa = self.energy_yukawa(rho)
         entropy = 1/self.beta * BinEntropy(P)
 
         energy_free = energy_kinetic + energy_external + energy_yukawa + entropy
-        objective = energy_free - self.mu * jnp.sum(rho)
-        # return objective, energy_free
-        return objective, energy_free, energy_kinetic, energy_external, energy_yukawa, entropy, sum(rho)
+        objective = energy_free - mu * jnp.sum(rho)
+        # return objective, energy_free 
+        res = {
+            "objective": objective,
+            "energy_free": energy_free,
+            "energy_kinetic": energy_kinetic,
+            "energy_external": energy_external,
+            "energy_yukawa": energy_yukawa,
+            "entropy": entropy,
+            "sum_rho": sum(rho)
+        }
+        return res
     
     # @partial(jit, static_argnums=(0,))
     def density_matrix(self, H):
         w, V = jnp.linalg.eigh(H)
         w = jnp.clip(w, -500, 500)
         w1 = 1/(1+jnp.exp(self.beta*w))
-        return V @ jnp.diag(w1) @ V.T
+        return jnp.real(V @ jnp.diag(w1) @ V.T) # [N_vec, N_vec]
     
     def density_function(self, H):
         P = self.density_matrix(H)
-        return jnp.diag(P)
+        return jnp.diag(P) # [N_vec]
     
-    @partial(jit, static_argnums=(0,))
-    def gradient(self, H):
-        P = self.density_matrix(H)
-        rho = jnp.diag(P)
-        grad = self.C + jnp.diag(self.potential_yukawa(rho))
-        return grad
+    def gradient(self, H, cheat=False, N_samples=100):
+        if cheat:
+            w, V = jnp.linalg.eigh(H)
+            w = jnp.clip(w, -500, 500)
+            w1 = jnp.sqrt(1/(1+jnp.exp(self.beta*w)))
+            P_half = V @ jnp.diag(w1) @ V.T
+            v = jnp.complex128(jax.random.normal(jax.random.PRNGKey(self.key), (self.N_vec, N_samples))) # [N_vec, N_samples]
+            fv = P_half @ v 
+            rho = jnp.diag(fv.dot(fv.T))/N_samples 
+            grad = self.C+ jnp.diag(self.potential_yukawa(rho))
+            self.key += 1
+        else:
+            P = self.density_matrix(H)
+            rho = jnp.diag(P)
+            grad = self.C+ jnp.diag(self.potential_yukawa(rho))
+        rho = jnp.real(rho)
+        return grad,rho # [N_vec, N_vec]
+    
 
 class StochasticHamiltonian(Hamiltonian):
     def __init__(self, Ns, Ls, beta=1,mu=0, N_poles=100, alpha=0, fourier=True, dense=False):
@@ -325,88 +350,116 @@ class StochasticHamiltonian(Hamiltonian):
         self.weights = None 
         self.key = 0
         self.N_poles = N_poles
-        self.N_vec = Ns[0]*Ns[1]*Ns[2]
+        self.N_vec = np.prod(Ns)
+
+        # generate initial shifts and weights
+        self.update_poles_shifts(-1/2, 0)
     
     def update_poles_shifts(self, c_H, v_H):
         energy_min = np.max(self.fourier_laplacian)*c_H + np.min(v_H) # The minimum eigenvalue of the Hamiltonian
-        energy_max = -np.min(self.fourier_laplacian)*c_H + np.max(v_H) # The maximum eigenvalue of the Hamiltonian
+        energy_max = np.min(self.fourier_laplacian)*c_H + np.max(v_H) # The maximum eigenvalue of the Hamiltonian
         self.shifts, self.weights = gen_contour(energy_min, energy_max, self.beta, self.N_poles)
 
-    # @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,3))
     def density_function(self, c_H, v_H, N_samples=100, tol=1e-6):
         # Generate Gaussian random vectors
-        v = jnp.complex128(jax.random.normal(jax.random.PRNGKey(self.key), (self.N_vec, N_samples)))
+        v = jnp.complex128(jax.random.normal(jax.random.PRNGKey(self.key), (self.N_vec, N_samples))) # [N_vec, N_samples]
         
         # Compute the matrix-vector product
-        fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts)
-        fv = contour_matvec(c_H, v_H,self.Ns, self.fourier_laplacian, v, tol, self.shifts, fermi_dirac_weights)
+        fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts) # [N_poles]
+        fv = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, fermi_dirac_weights) # [N_vec, N_samples]
         
         # Update the key for the next random number generation
         self.key += 1 
         
         # Compute the estimate of the density function
-        estimate_density_function = (jnp.diag(fv.dot(fv.T))/N_samples).reshape([self.N_vec, 1]).real 
+        estimate_density_function = (jnp.diag(fv.dot(fv.T))/N_samples).flatten().real # [N_vec]
 
-        return estimate_density_function
+        return estimate_density_function,v
 
-    # @partial(jit, static_argnums=(0,))
+
     def gradient(self, c_H, v_H, N_samples=100, tol=1e-6):
 
-        estimate_density_function = self.density_function(c_H, v_H, N_samples, tol)
+        estimate_density_function,v = self.density_function(c_H, v_H, N_samples, tol) # [N_vec]
 
         # Compute the gradient
-        # Recall that we save H = c_H K + diag^*(v_H). 
+        # Recall that we save H = c_H * K + diag^*(v_H), where c_H is a scalar and v_H is a vector.
         # We will decompose the gradient w.r.t c_H and v_H separately.
+
+
         gradient_c_H = -1/2 
-        gradient_v_H = fftnProduct(self.fourier_yukawa, estimate_density_function) + self.potential_external - self.mu
+        gradient_v_H = self.potential_yukawa(estimate_density_function) + self.potential_external # [N_vec]
 
-        return gradient_c_H, gradient_v_H
+        return gradient_c_H, gradient_v_H.real, estimate_density_function # [1], [N_vec], [N_vec]
 
-    # @partial(jit, static_argnums=(0,1,3))
-    def objective(self, c_H, v_H, N_samples=100, tol=1e-6):
+    def objective(self, c_H, v_H, N_samples=100, tol=1e-6, mu=1):
         # Generate Gaussian random vectors
         v = jnp.complex128(jax.random.normal(jax.random.PRNGKey(self.key), (self.N_vec, N_samples)))
 
         # Compute the matrix-vector product
-        square_root_fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts)
-        square_root_fermi_dirac_H_v = contour_matvec(c_H, v_H, self.Ns, self.fourier_laplacian, v, tol, self.shifts, square_root_fermi_dirac_weights)
+        square_root_fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts) # [N_poles]
+        square_root_fermi_dirac_H_v = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, square_root_fermi_dirac_weights) # [N_vec, N_samples]
 
-        bin_entropy_fermi_dirac_weights = self.weights * complex_bin_entropy_fermi_dirac(self.beta*self.shifts)
-        bin_entropy_fermi_dirac_H_v = contour_matvec(c_H, v_H,self.Ns, self.fourier_laplacian, v, tol, self.shifts, bin_entropy_fermi_dirac_weights)
-        estimate_density_function = (jnp.diag(square_root_fermi_dirac_H_v.dot(square_root_fermi_dirac_H_v.T))/N_samples).reshape([self.N_vec, 1]).real 
+        bin_entropy_fermi_dirac_weights = self.weights * complex_bin_entropy_fermi_dirac(self.beta*self.shifts) # [N_poles]
+        bin_entropy_fermi_dirac_H_v = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, bin_entropy_fermi_dirac_weights) # [N_vec, N_samples]
+        estimate_density_function = (jnp.diag(square_root_fermi_dirac_H_v.dot(square_root_fermi_dirac_H_v.T))/N_samples).flatten().real # [N_vec]
 
         # Estimate the energy
         # There are three parts: sinple electron term, Hartree term, and entropy term
         # single electron term is tr(C*P) = tr(-1/2 K P) + v_{ext} \otimes rho
         
         # kinetic energy 
-        energy_kinetic = -1/2 * jnp.trace(square_root_fermi_dirac_H_v.T.dot(fftnProduct(self.fourier_laplacian, square_root_fermi_dirac_H_v))).real/N_samples
+        energy_kinetic = -1/2 * jnp.trace(square_root_fermi_dirac_H_v.T.dot(fftnProduct(self.fourier_laplacian, square_root_fermi_dirac_H_v))).real/N_samples # scalar
 
         # External potential energy
-        energy_external = self.energy_external(estimate_density_function)
+        energy_external = self.energy_external(estimate_density_function) # scalar
 
         # Hartree energy 
-        energy_yukawa = self.energy_yukawa(estimate_density_function)
+        energy_yukawa = self.energy_yukawa(estimate_density_function) # scalar
 
         # Entropy energy
-        energy_entropy = 1/self.beta * jnp.trace(v.T.dot(bin_entropy_fermi_dirac_H_v).real)/N_samples
+        energy_entropy = 1/self.beta * jnp.trace(v.T.dot(bin_entropy_fermi_dirac_H_v).real)/N_samples # scalar
 
-        # Total energy
-        energy_free = energy_kinetic + energy_external + energy_yukawa + energy_entropy
+        # Total energy 
+        energy_free = energy_kinetic + energy_external + energy_yukawa + energy_entropy # scalar
 
         # print(energy_kinetic, energy_external, energy_hartree, energy_entropy)
         # return jnp.real(energy_kinetic), jnp.real(energy_external), jnp.real(energy_hartree), jnp.real(energy_entropy)
-        objective = energy_free - self.mu * jnp.sum(estimate_density_function)
-        return objective, energy_free, [jnp.real(energy_kinetic), jnp.real(energy_external), jnp.real(energy_yukawa), jnp.real(energy_entropy)]
+        objective = energy_free - mu * jnp.sum(estimate_density_function) # scalar
 
+        res = {
+            "objective": jnp.real(objective),
+            "energy_free": jnp.real(energy_free),
+            "energy_kinetic": jnp.real(energy_kinetic),
+            "energy_external": jnp.real(energy_external),
+            "energy_yukawa": jnp.real(energy_yukawa),
+            "energy_entropy": jnp.real(energy_entropy),
+            "sum_rho": jnp.sum(estimate_density_function)
+        }
+        return res
 
 if __name__ == "__main__":
+    # Test the potential
+    Ns = (11,11,11)
+    Ls = (1,1,1)
+    laplacian_fourier = genDiscretizedLaplacianEigenvalues(Ns, Ls)
+    laplacian_dense = genDiscretizedLaplacian(Ns, Ls)
+    yukawa_fourier = genDiscretizedYukawaInteractionEigenvalues(Ns, Ls, alpha=1)
+    yukawa_dense = genDiscretizedYukawaInteraction(Ns, Ls, alpha=1)
+    key = jax.random.PRNGKey(0)  # Add a PRNG key for reproducibility
+    v = jax.random.uniform(key, shape=(Ns[0]*Ns[1]*Ns[2],))
+    lap_fourier_v = fftnProduct(laplacian_fourier, v)
+    lap_dense_v = laplacian_dense.dot(v)
+    print(jnp.linalg.norm(lap_fourier_v - lap_dense_v))
+    yukawa_fourier_v = fftnProduct(yukawa_fourier, v)
+    yukawa_dense_v = yukawa_dense.dot(v)
+    print(jnp.linalg.norm(yukawa_fourier_v - yukawa_dense_v))
 
     # Genereate two Hamiltonians
     Ns = (11,11,11)
     Ls = (1,1,1)
-    det_H = deterministicHamiltonian(Ns, Ls, beta=2)
-    sto_H = StochasticHamiltonian(Ns, Ls, beta=2)
+    det_H = deterministicHamiltonian(Ns, Ls, beta=2, alpha=1)
+    sto_H = StochasticHamiltonian(Ns, Ls, beta=2, alpha=1)
     sto_H.key = 24
 
     # Generate a random H
@@ -427,3 +480,7 @@ if __name__ == "__main__":
     # Estimate energy 
     print(det_H.objective(H))
     print(sto_H.objective(c_H, v_H, N_samples=100))
+
+    # update external potential
+    det_H.update_external_yukawa(np.array([[0.2, 0.2, 0.2]]), np.array([10]))
+    print(det_H.potential_external[:10])

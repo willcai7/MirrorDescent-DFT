@@ -34,8 +34,8 @@ def gen_contour(Em, EM, beta, N, mu=0, function=None):
     m = (np.pi / (2 * 1)) ** 2
 
     # Scale the minimal and maximal eigenvalues with the chemical potential and inverse temperature.
-    low_b = (Em - mu) * beta
-    high_b = (EM - mu) * beta
+    low_b = max((Em - mu) * beta,-500)
+    high_b = min((EM - mu) * beta,500)
 
     # Compute an effective maximum squared value, ensuring it is at least as large as the square of the largest scaled eigenvalue.
     # Adding m guarantees that the value is strictly positive.
@@ -86,56 +86,50 @@ def gen_contour(Em, EM, beta, N, mu=0, function=None):
     # Scale the poles and weights by beta and return.
     return xi / beta, w / beta
 
-def contour_f(x,xi,w):
+def contour_f(x, xi, w):
     """
     Evaluate the contour integral of a function f along a contour defined by poles xi and weights w.
+    Handles batches of x values efficiently.
+    
+    Args:
+        x: (np.array [batch_size]) Input points to evaluate
+        xi: (np.array [n_poles]) Contour poles
+        w: (np.array [n_poles]) Contour weights
+        
+    Returns:
+        (np.array [batch_size]) Contour integral evaluated at each x
     """
-    value = sum(w/(xi-x))
-    return np.imag(value)
+    # Reshape x to [batch_size, 1] and xi to [1, n_poles] for broadcasting
+    x = np.asarray(x)[..., np.newaxis]
+    xi = np.asarray(xi)[np.newaxis, :]
+    w = np.asarray(w)[np.newaxis, :]
+    
+    # Compute 1/(xi-x) for all x,xi pairs at once
+    denominators = 1.0 / (xi - x)
+    
+    # Multiply by weights and sum over poles dimension
+    values = np.sum(w * denominators, axis=-1)
+    
+    return np.imag(values)
+
 
 def complex_square_root_fermi_dirac(Z):
     """
-    A holomorphic extension of the square-root Fermi-Dirac function. 
-    This function is holomorphic in the regions {Re(z) < 0} and {Re(z) > 0} 
-    as well as in the strip {Re(z) = 1, -2 < Im(z) < 2}.
-
+    The holomorphic extension of square root of Fermi-Dirac function.
     Args:
-        Z: (np.array) Complex number(s).
+      Z: (np.array [n,m]) The input of square root Fermi-Dirac function.
 
     Returns:
-        S: (np.array) Holomorphic extension of the square-root Fermi-Dirac function.
+      S: (np.array [n,m]) The result of pointwise square root FD function applied to Z.
     """
-    # Extract half of the real part of Z
-    X = np.real(Z) / 2
-
-    # Extract half of the imaginary part of Z
-    Y = np.imag(Z) / 2
-
-    # Compute the magnitude component:
-    # Calculate the absolute value of (1 - tanh(X + iY)) / 2.
-    # This forms the basis for the square-root transformation.
-    R = np.abs((1 - np.tanh(X + 1j * Y)) / 2)
-
-    # Compute the adjusted phase angle:
-    # Start with the phase of (1 - tanh(X + iY)) and adjust it by adding a multiple of 2*pi.
-    # The floor function is used here to ensure the phase is continuously adjusted 
-    # across branch cuts, aligning with the desired holomorphic extension.
-    Theta = 2 * np.pi - 2 * np.pi * np.floor((Y - np.pi / 2) / np.pi) + np.angle(1 - np.tanh(X + 1j * Y))
-
-    # Compute the "right" branch (for X >= 0) of the square-root Fermi-Dirac function:
-    # Take the square root of the magnitude R and apply half the adjusted phase angle.
-    S_right = np.sqrt(R) * np.exp(1j * Theta / 2)
-
-    # Compute the "left" branch (for X <= 0) directly:
-    # Here we take the square root of (1 - tanh(X + iY)) / 2 without phase adjustment.
-    S_left = np.sqrt((1 - np.tanh(X + 1j * Y)) / 2)
-
-    # Select the appropriate branch based on the sign of X:
-    # Use S_left when the real part (after halving) is non-positive,
-    # and S_right when it is non-negative.
-    S = S_left * (X <= 0) + S_right * (X >= 0)
-
-    # Return the holomorphic extension of the square-root Fermi-Dirac function.
+    Z = jnp.asarray(Z)
+    X = jnp.real(Z)/2
+    Y = jnp.imag(Z)/2
+    R = jnp.abs((1 - jnp.tanh(X + 1j * Y)) / 2)
+    Theta = 2 * jnp.pi - 2 * jnp.pi * jnp.floor((Y - jnp.pi / 2) / jnp.pi) + jnp.angle(1 - jnp.tanh(X + 1j * Y))
+    S_right = jnp.sqrt(R) * jnp.exp(1j * Theta / 2)
+    S_left = jnp.sqrt((1 - jnp.tanh(X + 1j * Y)) / 2)
+    S = S_left * (X <= 0) + S_right * (X > 0)
     return S
 
 def complex_log_one_plus_exp(z):
@@ -234,114 +228,115 @@ def complex_bin_entropy_fermi_dirac(z):
     """
     return complex_entropy_fermi_dirac(z) + complex_entropy_fermi_dirac(-z)
 
-# The function is jitted with JAX for efficiency, treating the first and third arguments as static.
-@partial(jax.jit, static_argnums=(0, 2))
-def shift_inv_system(c_H, v_H, Ns, D, v, shift, tol): 
+
+@jit
+def contour_matvec(c_H, v_H, D, v, tol, shifts, weights, batch_size=20):
     """
-    Solve a shifted linear system using the BiCGStab iterative solver. Here the linear system is defined by an abstract operator. 
-    $$ A = shift - c_H * F* D* F^* - diag(v_H) $$
-    We are solving the system $A x = v$ for $x$.
+    Compute matrix-vector products along a contour in batches using shift-and-invert.
     
     Args:
-        c_H: (real) Coefficient for the Laplacian.
-        v_H: (np.array [Ns[0]*Ns[1]*Ns[2]]) Diagonal operator.
-        Ns: (np.array [3]) Number of grid points in each dimension.
-        D: (np.array [Ns[0]*Ns[1]*Ns[2]]) Discretized Laplacian eigenvalues.
-        v: (np.array [Ns[0]*Ns[1]*Ns[2], n]) Right-hand side vector.
-        shift: (np.array) Shift value for the linear system.
-        tol: (real) Convergence tolerance for the iterative solver.
-
+        c_H: (Float) Scalar coefficient for the Hamiltonian
+        v_H: (jnp.array [N_vec]) Vector potential term
+        D: (jnp.array [Ns]) Discretized Laplacian eigenvalues
+        v: (jnp.array [N_vec, N_samples]) Input vectors to multiply with
+        tol: (Float) Tolerance for the linear solver
+        shifts: (jnp.array [N_poles]) Complex shifts along the contour
+        weights: (jnp.array [N_poles]) Complex weights for the contour integration
+        batch_size: (Int) Number of shifts to process in parallel
+        
     Returns:
-        x: (np.array [Ns[0]*Ns[1]*Ns[2], n]) Solution to the linear system.
-
+        (jnp.array [N_vec, N_samples]) Imaginary part of the weighted sum of matrix-vector products
     """
-    # Define the linear operator for the shifted system
+    results = []
+    for i in range(0, len(shifts), batch_size):
+        batch_shifts = shifts[i:i+batch_size]
+        batch_weights = weights[i:i+batch_size]
+        x = vmap(shift_inv_system, in_axes=(None, None, None, None, 0, None))(c_H, v_H,  D, v, batch_shifts, tol)
+        results.append(jnp.einsum('ijk,i->jk', x, batch_weights))
+    return jnp.imag(sum(results))
+    
+@jit
+def shift_inv_system(c_H, v_H, D, v, shift, tol): 
+    """
+    Solve the shifted linear system (shift - H)x = v using BiCGSTAB with FFT preconditioning.
+    
+    Args:
+        c_H: (Float) Scalar coefficient for the Hamiltonian
+        v_H: (jnp.array [N_vec]) Vector potential term
+        D: (jnp.array [Ns]) Discretized Laplacian eigenvalues
+        v: (jnp.array [N_vec, N_samples]) Right-hand side vector
+        shift: (complex) Complex shift
+        tol: (Float) Tolerance for convergence
+        
+    Returns:
+        (jnp.array [N_vec, N_samples]) Solution vector x satisfying (shift - H)x = v
+    """
+    Ns = D.shape
     @jit
     def linearmap(u):
-        """
-        Apply the linear operator to a vector u.
-        The operator is defined as A = shift - c_H * F*D*F^* - diag(v_H).
-        """
-
-        # Multiply u by the vector v_H (expanded along a new axis) to create a term to subtract later.
+        # Apply the shifted Hamiltonian operator (shift - H)u
         temp_v = v_H[:, None] * u
-
-        # Reshape u to a multi-dimensional array with spatial dimensions Ns[0], Ns[1], Ns[2] 
-        # and perform a forward FFT along the spatial axes.
-        u = jnp.fft.fftn(u.reshape([Ns[0], Ns[1], Ns[2], -1]), axes=[0, 1, 2])
-
-        # Multiply the FFT result element-wise by (shift - c_H * D).
-        # The extra axis is added to match the dimensions for broadcasting.
-        u = jnp.multiply((shift - c_H * D)[:, :, :, None], u)
-
-        # Transform the product back to real space using the inverse FFT,
-        # then flatten the spatial dimensions.
-        u = jnp.fft.ifftn(u, axes=[0, 1, 2]).reshape([Ns[0] * Ns[1] * Ns[2], -1])
-
-        # Subtract the previously computed term (temp_v) to complete the linear mapping.
+        shape = list(Ns) + [-1]
+        axes = list(range(len(Ns)))
+        u = jnp.fft.fftn(u.reshape(shape), axes=axes)
+        u = jnp.multiply((shift - c_H * D)[..., None], u)
+        u = jnp.fft.ifftn(u, axes=axes).reshape([-1, u.shape[-1]])
         u = u - temp_v
         return u
 
-    # Define the preconditioner for the system, which approximates the inverse of the operator.
     @jit
     def precondition_linearmap(u):
-        """
-        Apply the preconditioner to a vector u.
-        The preconditioner is defined as the reciprocal of (shift - c_H * F*D*F^*).
-        """
-        # Reshape u to the spatial grid dimensions and perform a forward FFT.
-        u = jnp.fft.fftn(u.reshape([Ns[0], Ns[1], Ns[2], -1]), axes=[0, 1, 2])
-
-        # Multiply element-wise by the reciprocal of (shift - c_H * D) to precondition the system.
-        u = jnp.multiply((1 / (shift - c_H * D))[:, :, :, None], u)
-
-        # Perform the inverse FFT to transform back to real space and flatten the spatial dimensions.
-        u = jnp.fft.ifftn(u, axes=[0, 1, 2]).reshape([Ns[0] * Ns[1] * Ns[2], -1])
+        # Apply the inverse of the diagonal part as preconditioner
+        shape = list(Ns) + [-1]
+        axes = list(range(len(Ns)))
+        u = jnp.fft.fftn(u.reshape(shape), axes=axes)
+        u = jnp.multiply((1 / (shift - c_H * D))[..., None], u)
+        u = jnp.fft.ifftn(u, axes=axes).reshape([-1, u.shape[-1]])
         return u
 
-    # Use the BiCGStab iterative solver from JAX's sparse linear algebra library to solve the linear system.
-    # - 'linearmap' defines the linear operator.
-    # - 'v' is the right-hand side vector.
-    # - 'tol' sets the convergence tolerance.
-    # - 'M=precondition_linearmap' provides the fixed preconditioner.
-    # - 'maxiter=100' sets the maximum number of iterations.
-    # The solver returns a tuple where the first element is the solution.
     return jax.scipy.sparse.linalg.bicgstab(linearmap, v, tol=tol, M=precondition_linearmap, maxiter=100)[0]
 
-# The function is jitted with JAX for efficiency, treating the first and third arguments as static.
-@partial(jax.jit, static_argnums=(0,2))
-def contour_matvec(c_H, v_H, Ns, D, v, tol, shifts, weights):
-    """
-    Perform a matrix-vector product using a contour integral method.
-    The method involves solving a shifted linear system for each shift in the contour.
-    The results are then combined using the weights associated with each shift.
 
-    Args:
-        c_H: (real) Coefficient for the Laplacian.
-        v_H: (np.array [Ns[0]*Ns[1]*Ns[2]]) Diagonal operator.
-        Ns: (np.array [3]) Number of grid points in each dimension.
-        D: (np.array [Ns[0]*Ns[1]*Ns[2]]) Discretized Laplacian eigenvalues.
-        v: (np.array [Ns[0]*Ns[1]*Ns[2], n]) Right-hand side vector.
-        tol: (real) Convergence tolerance for the iterative solver.
-        shifts: (np.array [2N]) Shift values for the contour.
-        weights: (np.array [2N]) Weights associated with each shift.
-    
-    Returns:
-        x: (np.array [Ns[0]*Ns[1]*Ns[2], n]) Result of the contour matrix-vector product.
-    """
-    
-    # Apply the shift_inv_system function to each element in the 'shifts' array.
-    # vmap vectorizes the computation over shifts (in_axes=0 for shifts) while keeping
-    # other parameters (c_H, v_H, Ns, D, v, tol) fixed across all evaluations.
-    x = vmap(shift_inv_system, in_axes=(None, None, None, None, None, 0, None))(
-        c_H, v_H, Ns, D, v, shifts, tol
-    )
-    
-    # Use Einstein summation to combine the results 'x' weighted by the 'weights' vector.
-    # The einsum 'ijk,i->jk' multiplies each slice along the first axis (corresponding to each shift)
-    # by the corresponding weight and then sums over that axis.
-    weighted_sum = jnp.einsum('ijk,i->jk', x, weights)
-    
-    # Return only the imaginary part of the weighted sum.
-    # This extracts the final contour matrix-vector product result.
-    return jnp.imag(weighted_sum)
+if __name__ == "__main__":
+
+    input = jnp.linspace(-10, 10, 100) + 1j*jnp.linspace(-10, 10, 100)[:, jnp.newaxis]
+    output = complex_square_root_fermi_dirac(input)
+    input_real = jnp.linspace(-10, 10, 100) 
+    input_real = jnp.complex128(input_real)
+    output_real = complex_square_root_fermi_dirac(input_real)
+    output_real = jnp.real(output_real)
+    true_output_real = jnp.sqrt(1/(1+jnp.exp(input_real)))
+
+    plt.figure(figsize=(10,4), dpi=100)
+    plt.subplot(1,2,1)
+    # plt.figure(figsize=(4,8), dpi=100)
+    plt.imshow(np.real(output), extent=(-7, 7, -7, 7))
+    plt.colorbar()
+    plt.scatter([0,0],[2,-2], color='red')
+    plt.title("Real part")
+    # plt.show()
+
+    plt.subplot(1,2,2)
+    # plt.figure(figsize=(8,8), dpi=100)
+    plt.imshow(np.imag(output), extent=(-7, 7, -7, 7))
+    plt.colorbar()
+    plt.scatter([0,0],[2,-2], color='red')
+    plt.title("Imaginary part")
+    plt.savefig("contour_real_imag.png")
+
+    plt.figure(figsize=(10,4), dpi=100)
+    plt.subplot(1,2,1)
+    plt.plot(input_real, output_real, label="implementation")
+    plt.plot(input_real, true_output_real, label="true")
+    plt.legend()
+    plt.title("Real part")
+    plt.xlabel("Input")
+    plt.ylabel("Output")
+
+    plt.subplot(1,2,2)
+    plt.semilogy(input_real, np.abs(output_real-true_output_real))
+    plt.title("Error")
+    plt.xlabel("Input")
+    plt.ylabel("Error")
+    plt.tight_layout()
+    plt.savefig("contour_real_error.png")

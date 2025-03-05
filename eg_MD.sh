@@ -1,0 +1,12 @@
+python src/trainings/train_MD.py \
+    --dim=1 \
+    --N=101 \
+    --L=20.0 \
+    --beta=10.0 \
+    --alpha=0.5 \
+    --N_electrons=2 \
+    --cheat=True \
+    --N_samples=10 \
+    --N_poles=100 \
+    --max_iter=500 \
+    --raw=False
