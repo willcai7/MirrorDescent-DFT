@@ -13,7 +13,7 @@ from jax._src.api import block_until_ready
 from functools import partial
 jax.config.update("jax_enable_x64", True)
 
-def gen_contour(Em, EM, beta, N, mu=0, function=None):
+def gen_contour(Em, EM, beta, N, mu=0, function=None, clip=True):
     """
     Generate a contour for a matrix M based on its minimal and maximal eigenvalues.
     This contour is used to perform matrix-vector (matvec) operations.
@@ -31,30 +31,39 @@ def gen_contour(Em, EM, beta, N, mu=0, function=None):
       w: (np.array [2N]) Weights associated with each pole.
     """
     # Define a constant m using (pi/2)^2; used in the transformation.
-    m = (np.pi / (2 * 1)) ** 2
+    m = (np.pi/2) ** 2
 
     # Scale the minimal and maximal eigenvalues with the chemical potential and inverse temperature.
-    low_b = max((Em - mu) * beta,-500)
-    high_b = min((EM - mu) * beta,500)
+    if clip:
+        low_b = max((Em - mu) * beta,-500)
+        high_b = min((EM - mu) * beta,500)
+    else:
+        low_b = (Em - mu) * beta
+        high_b = (EM - mu) * beta
 
     # Compute an effective maximum squared value, ensuring it is at least as large as the square of the largest scaled eigenvalue.
     # Adding m guarantees that the value is strictly positive.
     M = np.maximum(np.abs(low_b), np.abs(high_b)) ** 2 + m
 
     # Calculate the parameter k used for elliptic integral transformations.
-    k = (np.sqrt(M - m) - 1) / (np.sqrt(M - m) + 1)
+    k = (np.sqrt(M / m) - 1) / (np.sqrt(M / m) + 1)
+    # print("M",M)
+    # print("m",m)
+    # print("K",k)
 
     # Compute the complete elliptic integrals of the first kind:
     # K for modulus squared (k^2) and Kp for the complementary modulus (1 - k^2).
     K = scipy.special.ellipk(k ** 2)
+    # print("K",K)
     Kp = scipy.special.ellipk(1 - k ** 2)
+    # print("Kp",Kp)
 
     # Generate an array of complex parameters t along the contour.
     # t includes an imaginary shift (Kp/2 * 1j) and is uniformly spaced along the real part after a shift by -K.
     t = 1j * Kp / 2 - K + np.linspace(0.5, N - 0.5, N) * (2 * K / N)
 
     # Evaluate the Jacobi elliptic functions sn, cn, and dn for the array t.
-    ej = spx.ellipj(t, k ** 2)
+    ej = spx.ellipj(t, k**2)
     sn = ej[0]  # Jacobi sine function
     cn = ej[1]  # Jacobi cosine function
     dn = ej[2]  # Delta amplitude
@@ -84,7 +93,7 @@ def gen_contour(Em, EM, beta, N, mu=0, function=None):
         w = w * complex_bin_entropy_fermi_dirac(xi)
         
     # Scale the poles and weights by beta and return.
-    return xi / beta, w / beta
+    return xi/beta , w /beta 
 
 def contour_f(x, xi, w):
     """
@@ -248,11 +257,18 @@ def contour_matvec(c_H, v_H, D, v, tol, shifts, weights, batch_size=20):
         (jnp.array [N_vec, N_samples]) Imaginary part of the weighted sum of matrix-vector products
     """
     results = []
-    for i in range(0, len(shifts), batch_size):
-        batch_shifts = shifts[i:i+batch_size]
-        batch_weights = weights[i:i+batch_size]
-        x = vmap(shift_inv_system, in_axes=(None, None, None, None, 0, None))(c_H, v_H,  D, v, batch_shifts, tol)
-        results.append(jnp.einsum('ijk,i->jk', x, batch_weights))
+    if len(weights.shape) > 1:  # Check if weights is a matrix
+        for i in range(0, len(shifts), batch_size):
+            batch_shifts = shifts[i:i+batch_size]
+            batch_weights = weights[i:i+batch_size]
+            x = vmap(shift_inv_system, in_axes=(None, None, None, None, 0, None))(c_H, v_H,  D, v, batch_shifts, tol)
+            results.append(jnp.einsum('ijk,il->jkl', x, batch_weights))
+    else:  # weights is a 1D array
+        for i in range(0, len(shifts), batch_size):
+            batch_shifts = shifts[i:i+batch_size]
+            batch_weights = weights[i:i+batch_size]
+            x = vmap(shift_inv_system, in_axes=(None, None, None, None, 0, None))(c_H, v_H,  D, v, batch_shifts, tol)
+            results.append(jnp.einsum('ijk,i->jk', x, batch_weights))
     return jnp.imag(sum(results))
     
 @jit
@@ -290,53 +306,56 @@ def shift_inv_system(c_H, v_H, D, v, shift, tol):
         shape = list(Ns) + [-1]
         axes = list(range(len(Ns)))
         u = jnp.fft.fftn(u.reshape(shape), axes=axes)
-        u = jnp.multiply((1 / (shift - c_H * D))[..., None], u)
+        u = jnp.multiply((1 / (shift - c_H * D  - jnp.mean(v_H)))[..., None], u)
         u = jnp.fft.ifftn(u, axes=axes).reshape([-1, u.shape[-1]])
         return u
 
-    return jax.scipy.sparse.linalg.bicgstab(linearmap, v, tol=tol, M=precondition_linearmap, maxiter=100)[0]
+    return jax.scipy.sparse.linalg.bicgstab(linearmap, v, tol=tol, M=precondition_linearmap, maxiter=1000)[0]
 
 
 if __name__ == "__main__":
+    EM = 1
+    Em = -1
+    mu = 0
+    xi, w = gen_contour(Em, EM, 1, 4, mu=mu, function='fermi_dirac')
+    # input = jnp.linspace(-10, 10, 100) + 1j*jnp.linspace(-10, 10, 100)[:, jnp.newaxis]
+    # output = complex_square_root_fermi_dirac(input)
+    # input_real = jnp.linspace(-10, 10, 100) 
+    # input_real = jnp.complex128(input_real)
+    # output_real = complex_square_root_fermi_dirac(input_real)
+    # output_real = jnp.real(output_real)
+    # true_output_real = jnp.sqrt(1/(1+jnp.exp(input_real)))
 
-    input = jnp.linspace(-10, 10, 100) + 1j*jnp.linspace(-10, 10, 100)[:, jnp.newaxis]
-    output = complex_square_root_fermi_dirac(input)
-    input_real = jnp.linspace(-10, 10, 100) 
-    input_real = jnp.complex128(input_real)
-    output_real = complex_square_root_fermi_dirac(input_real)
-    output_real = jnp.real(output_real)
-    true_output_real = jnp.sqrt(1/(1+jnp.exp(input_real)))
+    # plt.figure(figsize=(10,4), dpi=100)
+    # plt.subplot(1,2,1)
+    # # plt.figure(figsize=(4,8), dpi=100)
+    # plt.imshow(np.real(output), extent=(-7, 7, -7, 7))
+    # plt.colorbar()
+    # plt.scatter([0,0],[2,-2], color='red')
+    # plt.title("Real part")
+    # # plt.show()
 
-    plt.figure(figsize=(10,4), dpi=100)
-    plt.subplot(1,2,1)
-    # plt.figure(figsize=(4,8), dpi=100)
-    plt.imshow(np.real(output), extent=(-7, 7, -7, 7))
-    plt.colorbar()
-    plt.scatter([0,0],[2,-2], color='red')
-    plt.title("Real part")
-    # plt.show()
+    # plt.subplot(1,2,2)
+    # # plt.figure(figsize=(8,8), dpi=100)
+    # plt.imshow(np.imag(output), extent=(-7, 7, -7, 7))
+    # plt.colorbar()
+    # plt.scatter([0,0],[2,-2], color='red')
+    # plt.title("Imaginary part")
+    # plt.savefig("contour_real_imag.png")
 
-    plt.subplot(1,2,2)
-    # plt.figure(figsize=(8,8), dpi=100)
-    plt.imshow(np.imag(output), extent=(-7, 7, -7, 7))
-    plt.colorbar()
-    plt.scatter([0,0],[2,-2], color='red')
-    plt.title("Imaginary part")
-    plt.savefig("contour_real_imag.png")
+    # plt.figure(figsize=(10,4), dpi=100)
+    # plt.subplot(1,2,1)
+    # plt.plot(input_real, output_real, label="implementation")
+    # plt.plot(input_real, true_output_real, label="true")
+    # plt.legend()
+    # plt.title("Real part")
+    # plt.xlabel("Input")
+    # plt.ylabel("Output")
 
-    plt.figure(figsize=(10,4), dpi=100)
-    plt.subplot(1,2,1)
-    plt.plot(input_real, output_real, label="implementation")
-    plt.plot(input_real, true_output_real, label="true")
-    plt.legend()
-    plt.title("Real part")
-    plt.xlabel("Input")
-    plt.ylabel("Output")
-
-    plt.subplot(1,2,2)
-    plt.semilogy(input_real, np.abs(output_real-true_output_real))
-    plt.title("Error")
-    plt.xlabel("Input")
-    plt.ylabel("Error")
-    plt.tight_layout()
-    plt.savefig("contour_real_error.png")
+    # plt.subplot(1,2,2)
+    # plt.semilogy(input_real, np.abs(output_real-true_output_real))
+    # plt.title("Error")
+    # plt.xlabel("Input")
+    # plt.ylabel("Error")
+    # plt.tight_layout()
+    # plt.savefig("contour_real_error.png")

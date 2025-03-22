@@ -1,15 +1,23 @@
-beta_list=(0.1 0.3 1 3 10 30)
-for beta in ${beta_list[@]}; do
-    python src/trainings/train_SMD.py \
-        --dim=1 \
-        --N=101 \
-        --L=20.0 \
-        --beta=$beta \
-        --alpha=0.5 \
-        --N_electrons=2 \
-        --cheat=True \
-        --N_samples=10 \
-        --N_poles=100 \
-        --max_iter=2000 \
-        --raw=False
-done
+export CUDA_VISIBLE_DEVICES=1
+python src/trainings/train_SMD.py \
+    --job_name='SMD' \
+    --dim=1 \
+    --N=1281 \
+    --L=10.0 \
+    --beta=10 \
+    --alpha=0.5 \
+    --cheat=True \
+    --N_samples=100 \
+    --N_poles=20 \
+    --max_iter=1000 \
+    --raw=True \
+    --ratio=1 \
+    --eval_iter=10 \
+    --update_poles_iter=50 \
+    --lr=0.5 \
+    --scf_compare=True \
+    --mu=0.0 \
+    --tol=1e-5 \
+    --decay='exp' \
+    --decay_iter=100 \
+    --plot=False

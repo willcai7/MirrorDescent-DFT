@@ -1,6 +1,7 @@
 import jax
 from jax import numpy as jnp
 import numpy as np
+import time
 from .contour import *
 
 jax.config.update("jax_enable_x64", True)
@@ -201,7 +202,8 @@ def genDiscretizedYukawaInteraction(Ns, Ls, alpha):
     
     return K.T
 
-def gen_centers(num_particles, Ns):
+def gen_centers(num_particles, Ns, seed=224):
+    np.random.seed(seed)
     if len(Ns) == 1:
         return np.random.uniform(0, Ns[0], num_particles)
     else:
@@ -272,6 +274,15 @@ class Hamiltonian:
         self.density_external = gen_rho_ext(n_particles, self.Ns)
         self.potential_external = -self.potential_yukawa(self.density_external)
         self.update_single_electron_effective_potential()
+    
+    def update_external_yukawa_centers(self, centers, masses):
+        rho_ext = np.zeros(self.Ns)
+        for i in range(len(centers)):
+            rho_ext[tuple(int(coord) for coord in centers[i])] += masses[i]
+        self.density_external = rho_ext.flatten()
+        self.potential_external = -self.potential_yukawa(self.density_external)
+        self.update_single_electron_effective_potential()
+
 
 class deterministicHamiltonian(Hamiltonian):
     def __init__(self, Ns, Ls, beta=1,mu=0, alpha=0, fourier=True, dense=True):
@@ -298,11 +309,9 @@ class deterministicHamiltonian(Hamiltonian):
         energy_yukawa = self.energy_yukawa(rho)
         entropy = 1/self.beta * BinEntropy(P)
 
-        energy_free = energy_kinetic + energy_external + energy_yukawa + entropy
-        objective = energy_free - mu * jnp.sum(rho)
+        energy_free = energy_kinetic + energy_external + energy_yukawa + entropy - mu * jnp.sum(rho)
         # return objective, energy_free 
         res = {
-            "objective": objective,
             "energy_free": energy_free,
             "energy_kinetic": energy_kinetic,
             "energy_external": energy_external,
@@ -359,6 +368,10 @@ class StochasticHamiltonian(Hamiltonian):
         energy_min = np.max(self.fourier_laplacian)*c_H + np.min(v_H) # The minimum eigenvalue of the Hamiltonian
         energy_max = np.min(self.fourier_laplacian)*c_H + np.max(v_H) # The maximum eigenvalue of the Hamiltonian
         self.shifts, self.weights = gen_contour(energy_min, energy_max, self.beta, self.N_poles)
+        square_root_fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts) # [N_poles]
+        bin_entropy_fermi_dirac_weights = self.weights * complex_bin_entropy_fermi_dirac(self.beta*self.shifts) # [N_poles]
+        combined_weights = jnp.stack([square_root_fermi_dirac_weights, bin_entropy_fermi_dirac_weights], axis=1) # [N_poles, 2]
+        self.combined_weights = combined_weights
 
     # @partial(jit, static_argnums=(0,3))
     def density_function(self, c_H, v_H, N_samples=100, tol=1e-6):
@@ -386,30 +399,33 @@ class StochasticHamiltonian(Hamiltonian):
         # Recall that we save H = c_H * K + diag^*(v_H), where c_H is a scalar and v_H is a vector.
         # We will decompose the gradient w.r.t c_H and v_H separately.
 
-
         gradient_c_H = -1/2 
         gradient_v_H = self.potential_yukawa(estimate_density_function) + self.potential_external # [N_vec]
 
         return gradient_c_H, gradient_v_H.real, estimate_density_function # [1], [N_vec], [N_vec]
 
-    def objective(self, c_H, v_H, N_samples=100, tol=1e-6, mu=1):
+    def objective(self, c_H, v_H, N_samples=100, tol=1e-5, mu=0):
         # Generate Gaussian random vectors
         v = jnp.complex128(jax.random.normal(jax.random.PRNGKey(self.key), (self.N_vec, N_samples)))
+        self.key += 1
+        
+        combined_H_v = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, self.combined_weights) # [N_vec, N_samples, 2]
 
-        # Compute the matrix-vector product
-        square_root_fermi_dirac_weights = self.weights * complex_square_root_fermi_dirac(self.beta*self.shifts) # [N_poles]
-        square_root_fermi_dirac_H_v = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, square_root_fermi_dirac_weights) # [N_vec, N_samples]
 
-        bin_entropy_fermi_dirac_weights = self.weights * complex_bin_entropy_fermi_dirac(self.beta*self.shifts) # [N_poles]
-        bin_entropy_fermi_dirac_H_v = contour_matvec(c_H, v_H, self.fourier_laplacian, v, tol, self.shifts, bin_entropy_fermi_dirac_weights) # [N_vec, N_samples]
-        estimate_density_function = (jnp.diag(square_root_fermi_dirac_H_v.dot(square_root_fermi_dirac_H_v.T))/N_samples).flatten().real # [N_vec]
+        square_root_fermi_dirac_H_v = combined_H_v[:,:,0] # [N_vec, N_samples]
+        bin_entropy_fermi_dirac_H_v = combined_H_v[:,:,1] # [N_vec, N_samples]
+       
+        estimate_density_function = (jnp.sum((square_root_fermi_dirac_H_v)**2, axis=1)/N_samples).real # [N_vec]
+
+        grad_CH = - 1/2
+        grad_vH = self.potential_yukawa(estimate_density_function) + self.potential_external # [N_vec]
 
         # Estimate the energy
         # There are three parts: sinple electron term, Hartree term, and entropy term
         # single electron term is tr(C*P) = tr(-1/2 K P) + v_{ext} \otimes rho
         
         # kinetic energy 
-        energy_kinetic = -1/2 * jnp.trace(square_root_fermi_dirac_H_v.T.dot(fftnProduct(self.fourier_laplacian, square_root_fermi_dirac_H_v))).real/N_samples # scalar
+        energy_kinetic = -1/2 * jnp.sum(square_root_fermi_dirac_H_v * fftnProduct(self.fourier_laplacian, square_root_fermi_dirac_H_v)).real/N_samples # scalar
 
         # External potential energy
         energy_external = self.energy_external(estimate_density_function) # scalar
@@ -418,24 +434,23 @@ class StochasticHamiltonian(Hamiltonian):
         energy_yukawa = self.energy_yukawa(estimate_density_function) # scalar
 
         # Entropy energy
-        energy_entropy = 1/self.beta * jnp.trace(v.T.dot(bin_entropy_fermi_dirac_H_v).real)/N_samples # scalar
+        energy_entropy = 1/self.beta * jnp.sum(bin_entropy_fermi_dirac_H_v * v).real/N_samples # scalar
 
         # Total energy 
-        energy_free = energy_kinetic + energy_external + energy_yukawa + energy_entropy # scalar
-
-        # print(energy_kinetic, energy_external, energy_hartree, energy_entropy)
-        # return jnp.real(energy_kinetic), jnp.real(energy_external), jnp.real(energy_hartree), jnp.real(energy_entropy)
-        objective = energy_free - mu * jnp.sum(estimate_density_function) # scalar
+        energy_free = energy_kinetic + energy_external + energy_yukawa + energy_entropy  - mu * jnp.sum(estimate_density_function) # scalar
 
         res = {
-            "objective": jnp.real(objective),
             "energy_free": jnp.real(energy_free),
             "energy_kinetic": jnp.real(energy_kinetic),
             "energy_external": jnp.real(energy_external),
             "energy_yukawa": jnp.real(energy_yukawa),
-            "energy_entropy": jnp.real(energy_entropy),
-            "sum_rho": jnp.sum(estimate_density_function)
+            "entropy": jnp.real(energy_entropy),
+            "sum_rho": jnp.sum(estimate_density_function),
+            "grad_CH": grad_CH,
+            "grad_vH": grad_vH,
+            "density": estimate_density_function,
         }
+
         return res
 
 if __name__ == "__main__":
@@ -456,8 +471,8 @@ if __name__ == "__main__":
     print(jnp.linalg.norm(yukawa_fourier_v - yukawa_dense_v))
 
     # Genereate two Hamiltonians
-    Ns = (11,11,11)
-    Ls = (1,1,1)
+    Ns = (1281,)
+    Ls = (10,)
     det_H = deterministicHamiltonian(Ns, Ls, beta=2, alpha=1)
     sto_H = StochasticHamiltonian(Ns, Ls, beta=2, alpha=1)
     sto_H.key = 24
@@ -465,7 +480,8 @@ if __name__ == "__main__":
     # Generate a random H
     c_H = 0
     # v_H = np.random.rand(Ns[0]*Ns[1]*Ns[2])
-    v_H = np.cos(10*np.pi*np.arange(Ns[0]*Ns[1]*Ns[2])/Ns[0]/Ns[1]/Ns[2])*10
+    # v_H = np.cos(10*np.pi*np.arange(Ns[0]*Ns[1]*Ns[2])/Ns[0]/Ns[1]/Ns[2])*10
+    v_H = jax.random.normal(key, shape=(np.prod(Ns),))
     # v_H[100] = 10
     v_H = jnp.array(v_H)
     H = c_H * det_H.dense_laplacian + jnp.diag(v_H)
@@ -479,8 +495,8 @@ if __name__ == "__main__":
 
     # Estimate energy 
     print(det_H.objective(H))
-    print(sto_H.objective(c_H, v_H, N_samples=100))
+    print(sto_H.objective(c_H, v_H, N_samples=20))
 
     # update external potential
-    det_H.update_external_yukawa(np.array([[0.2, 0.2, 0.2]]), np.array([10]))
-    print(det_H.potential_external[:10])
+    # det_H.update_external_yukawa(np.array([[0.2, 0.2, 0.2]]), np.array([10]))
+    # print(det_H.potential_external[:10])

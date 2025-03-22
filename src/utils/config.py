@@ -15,7 +15,7 @@ class ProblemConfig:
 class OptimizerConfig:
     lr: Optional[float] = field(default=0.1)
     max_iter: Optional[int] = field(default=2000)
-    tol: Optional[float] = field(default=1e-8)
+    tol: Optional[float] = field(default=1e-5)
     poles_iter: Optional[int] = field(default=20)
     eval_iter: Optional[int] = field(default=2)
     update_poles_iter: Optional[int] = field(default=50)

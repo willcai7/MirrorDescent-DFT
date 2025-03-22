@@ -33,7 +33,7 @@ def binary_search_mu(eigvals, N_electrons, beta, tol=1e-3, max_iter=1000):
             
     raise RuntimeError(f"Binary search did not converge after {max_iter} iterations")
 
-def run_scf(ham, N_electrons, max_iter=100, tol=1e-8):
+def run_scf(ham, N_electrons, max_iter=100, tol=1e-8, mu=None,true_P_half=False):
     """
     Run self-consistent field iterations for the given Hamiltonian.
     
@@ -62,8 +62,9 @@ def run_scf(ham, N_electrons, max_iter=100, tol=1e-8):
         new_ham = (new_ham + new_ham.T)/2
 
         eigvals, eigvecs = jnp.linalg.eigh(new_ham)
-        eigvals = jnp.clip(eigvals, -400/beta, 400/beta)   
-        mu = binary_search_mu(eigvals, N_electrons, beta)
+        eigvals = jnp.clip(eigvals, -400/beta, 400/beta) 
+        if mu is None:
+            mu = binary_search_mu(eigvals, N_electrons, beta)
         eigvals = 1/(1+ jnp.exp(beta*(eigvals-mu)))
         X_scf = eigvecs @ jnp.diag(eigvals) @ eigvecs.T
         
@@ -82,7 +83,8 @@ def run_scf(ham, N_electrons, max_iter=100, tol=1e-8):
     res["density_matrix"] = X_scf
     res["iterations"] = i+1
     res["error"] = error
-
+    if true_P_half:
+        res["true_P_half"] = eigvecs @ jnp.diag(jnp.sqrt(eigvals)) @ eigvecs.T
     return res
 
 class GoldAlgo:
@@ -91,6 +93,7 @@ class GoldAlgo:
         self.ham = ham 
         self.n_samples = n_samples
         H = ham.C + jnp.diag(ham.potential_yukawa(rho_scf)) 
+        H = (H + H.T)/2
         eigvals, eigvecs = jnp.linalg.eigh(H)
         eigvals = jnp.clip(eigvals, -400/ham.beta, 400/ham.beta)
         eigvals = jnp.sqrt(1/(1+jnp.exp(ham.beta*(eigvals-mu))))
@@ -101,8 +104,9 @@ class GoldAlgo:
     def step(self):
         v = jax.random.normal(jax.random.PRNGKey(self.key), (self.ham.N_vec, self.n_samples))
         fv = self.half_P @ v
-        self.average_rho += jnp.diag(fv.dot(fv.T))
+        new_rho= jnp.diag(fv.dot(fv.T))
+        ratio = self.total_samples / (self.total_samples + self.n_samples)
+        self.average_rho = ratio * self.average_rho + (1-ratio) * new_rho/self.n_samples
         self.total_samples += self.n_samples
-        self.average_rho_temp = self.average_rho / self.total_samples
         self.key += 1
-        return self.average_rho_temp.real
+        return self.average_rho.real
