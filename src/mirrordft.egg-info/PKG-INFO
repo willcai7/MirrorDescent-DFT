@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: mirrordft
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: jax>=0.6.1
+Requires-Dist: matplotlib>=3.10.3
+Requires-Dist: transformers>=4.52.2
+Requires-Dist: wandb>=0.19.11

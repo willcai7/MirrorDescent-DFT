@@ -130,7 +130,7 @@ run_experiment() {
     # Run the experiment and capture both stdout and stderr
     (
         export CUDA_VISIBLE_DEVICES=$gpu_index
-        python src/trainings/train_SMD.py \
+        python -m mirrordft.trainings.train_SMD \
             --job_name='SMD' \
             --dim=$dim \
             --N=$N \
